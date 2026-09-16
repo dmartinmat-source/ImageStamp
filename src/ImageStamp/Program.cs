@@ -39,3 +39,7 @@ app.MapGet("/health", async (CompositionRepository repository, CancellationToken
 });
 
 app.Run();
+
+public partial class Program
+{
+}

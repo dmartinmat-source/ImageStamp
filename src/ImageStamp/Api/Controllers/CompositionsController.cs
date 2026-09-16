@@ -66,148 +66,110 @@ public sealed class CompositionsController(
             return Problem(uploadError, statusCode: StatusCodes.Status400BadRequest);
         }
 
-        LayerRequest[] layerRequests;
-
-        try
+        if (!TryParseLayerRequests(form, out LayerRequest[] layerRequests, out string? layerRequestError))
         {
-            string json = form["layers"].ToString();
-            layerRequests = string.IsNullOrWhiteSpace(json)
-                ? Array.Empty<LayerRequest>()
-                : JsonSerializer.Deserialize<LayerRequest[]>(json, LayerJsonOptions) ?? Array.Empty<LayerRequest>();
-        }
-        catch (JsonException exception)
-        {
-            return Problem("The 'layers' field is not valid JSON: " + exception.Message, statusCode: StatusCodes.Status400BadRequest);
+            return Problem(layerRequestError, statusCode: StatusCodes.Status400BadRequest);
         }
 
-        CompositionRequest compositionRequest = new CompositionRequest();
-        compositionRequest.BaseImageFileName = baseImageFile.FileName;
+        RequestBuildResult requestBuildResult = await BuildCompositionRequestAsync(
+            form,
+            baseImageFile,
+            layerRequests,
+            cancellationToken);
 
-        // The base image is the payload we inspect the most, so it is materialised once up front.
-        byte[] baseImageContent = await StreamHelpers.ReadFullyAsync(baseImageFile.OpenReadStream(), cancellationToken);
-        compositionRequest.BaseImage = new MemoryStream(baseImageContent, writable: false);
-
-        for (int i = 0; i < layerRequests.Length; i++)
+        if (requestBuildResult.Error is not null)
         {
-            LayerRequest layerRequest = layerRequests[i];
-
-            Layer layer = new Layer();
-            layer.Type = (layerRequest.Type ?? string.Empty).Trim().ToLowerInvariant();
-            layer.X = layerRequest.X;
-            layer.Y = layerRequest.Y;
-            layer.ZIndex = layerRequest.ZIndex;
-            layer.Opacity = layerRequest.Opacity;
-
-            if (layer.Type == LayerTypes.Image)
-            {
-                IFormFile? layerFile = string.IsNullOrWhiteSpace(layerRequest.ImageKey)
-                    ? null
-                    : form.Files[layerRequest.ImageKey];
-
-                if (layerFile is null)
-                {
-                    return Problem(
-                        "Layer " + i + ": no uploaded file matches the image key '" + layerRequest.ImageKey + "'.",
-                        statusCode: StatusCodes.Status400BadRequest);
-                }
-
-                uploadError = ValidateUpload(layerFile);
-
-                if (uploadError is not null)
-                {
-                    return Problem("Layer " + i + ": " + uploadError, statusCode: StatusCodes.Status400BadRequest);
-                }
-
-                layer.FileName = layerFile.FileName;
-                layer.Image = layerFile.OpenReadStream();
-            }
-            else if (layer.Type == LayerTypes.Solid)
-            {
-                layer.Width = layerRequest.Width;
-                layer.Height = layerRequest.Height;
-                layer.Color = layerRequest.Color;
-            }
-            else if (layer.Type == LayerTypes.Blur)
-            {
-                layer.Width = layerRequest.Width;
-                layer.Height = layerRequest.Height;
-                layer.Sigma = layerRequest.Sigma;
-            }
-            else
-            {
-                return Problem(
-                    "Layer " + i + ": unsupported layer type '" + layerRequest.Type + "'.",
-                    statusCode: StatusCodes.Status400BadRequest);
-            }
-
-            compositionRequest.Layers.Add(layer);
+            return Problem(requestBuildResult.Error, statusCode: StatusCodes.Status400BadRequest);
         }
+
+        CompositionRequest compositionRequest = requestBuildResult.Request!;
 
         if (!CompositionValidation.TryValidate(compositionRequest, _options, out string validationError))
         {
             return Problem(validationError, statusCode: StatusCodes.Status400BadRequest);
         }
 
-        Composition composition = new Composition();
-        composition.Id = Guid.NewGuid();
-        composition.CreatedAt = DateTimeOffset.UtcNow;
-        composition.Status = CompositionStatus.Pending;
-        composition.BaseImageFileName = compositionRequest.BaseImageFileName;
-        composition.LayerCount = compositionRequest.Layers.Count;
+        CompositionExecutionResult executionResult = await ComposeAndStoreAsync(compositionRequest, cancellationToken);
 
-        await repository.CreateCompositionAsync(composition, cancellationToken);
-
-        CompositionResult result;
-
-        try
+        if (executionResult.Error is not null)
         {
-            result = await compositionService.ComposeAsync(compositionRequest, cancellationToken);
-        }
-        catch (UnknownImageFormatException exception)
-        {
-            await repository.MarkFailedAsync(composition.Id, exception.Message, cancellationToken);
-            return Problem("One of the uploaded files is not a supported image.", statusCode: StatusCodes.Status400BadRequest);
-        }
-        catch (ImageFormatException exception)
-        {
-            await repository.MarkFailedAsync(composition.Id, exception.Message, cancellationToken);
-            return Problem("One of the uploaded images could not be decoded.", statusCode: StatusCodes.Status400BadRequest);
-        }
-        catch (Exception exception)
-        {
-            logger.LogError(exception, "Composition {CompositionId} failed.", composition.Id);
-            await repository.MarkFailedAsync(composition.Id, exception.Message, cancellationToken);
-            throw;
+            return Problem(executionResult.Error, statusCode: StatusCodes.Status400BadRequest);
         }
 
-        foreach (Layer layer in compositionRequest.Layers)
-        {
-            CompositionLayer stored = new CompositionLayer();
-            stored.Id = Guid.NewGuid();
-            stored.CompositionId = composition.Id;
-            stored.LayerType = layer.Type;
-            stored.X = layer.X;
-            stored.Y = layer.Y;
-            stored.Opacity = layer.Opacity;
-            stored.ZIndex = layer.ZIndex;
-            stored.FileName = layer.FileName;
-            stored.Width = layer.Width;
-            stored.Height = layer.Height;
-            stored.Color = layer.Color;
-            stored.Sigma = layer.Sigma;
+        Response.Headers["X-Composition-Id"] = executionResult.CompositionId!.Value.ToString();
 
-            await repository.AddLayerAsync(stored, cancellationToken);
+        return File(executionResult.Result!.Png, "image/png");
+    }
+
+    /// <summary>
+    /// Composes several base PNGs with shared layers and returns the results as a ZIP archive.
+    /// </summary>
+    [HttpPost("batch")]
+    [Consumes("multipart/form-data")]
+    [Produces("application/zip", "application/problem+json")]
+    public async Task<IActionResult> CreateBatch(CancellationToken cancellationToken)
+    {
+        if (!Request.HasFormContentType)
+        {
+            return Problem("The request must be sent as multipart/form-data.", statusCode: StatusCodes.Status400BadRequest);
         }
 
-        await repository.MarkCompletedAsync(
-            composition.Id,
-            result.OutputSizeBytes,
-            (int)result.ProcessingTimeMs,
-            cancellationToken);
+        IFormCollection form = await Request.ReadFormAsync(cancellationToken);
+        IReadOnlyList<IFormFile> baseImageFiles = form.Files.GetFiles("baseImages");
 
-        Response.Headers["X-Composition-Id"] = composition.Id.ToString();
+        if (baseImageFiles.Count == 0)
+        {
+            return Problem("At least one 'baseImages' file is required.", statusCode: StatusCodes.Status400BadRequest);
+        }
 
-        return File(result.Png, "image/png");
+        foreach (IFormFile baseImageFile in baseImageFiles)
+        {
+            string? uploadError = ValidateUpload(baseImageFile);
+
+            if (uploadError is not null)
+            {
+                return Problem(uploadError, statusCode: StatusCodes.Status400BadRequest);
+            }
+        }
+
+        if (!TryParseLayerRequests(form, out LayerRequest[] layerRequests, out string? layerRequestError))
+        {
+            return Problem(layerRequestError, statusCode: StatusCodes.Status400BadRequest);
+        }
+
+        List<PngArchiveEntry> archiveEntries = new List<PngArchiveEntry>(baseImageFiles.Count);
+
+        foreach (IFormFile baseImageFile in baseImageFiles)
+        {
+            RequestBuildResult requestBuildResult = await BuildCompositionRequestAsync(
+                form,
+                baseImageFile,
+                layerRequests,
+                cancellationToken);
+
+            if (requestBuildResult.Error is not null)
+            {
+                return Problem(requestBuildResult.Error, statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            CompositionRequest compositionRequest = requestBuildResult.Request!;
+
+            if (!CompositionValidation.TryValidate(compositionRequest, _options, out string validationError))
+            {
+                return Problem(validationError, statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            CompositionExecutionResult executionResult = await ComposeAndStoreAsync(compositionRequest, cancellationToken);
+
+            if (executionResult.Error is not null)
+            {
+                return Problem(executionResult.Error, statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            archiveEntries.Add(new PngArchiveEntry(baseImageFile.FileName, executionResult.Result!.Png));
+        }
+
+        return File(PngArchiveBuilder.Create(archiveEntries), "application/zip", "compositions.zip");
     }
 
     /// <summary>
@@ -271,5 +233,194 @@ public sealed class CompositionsController(
         }
 
         return null;
+    }
+
+    private static bool TryParseLayerRequests(IFormCollection form, out LayerRequest[] layerRequests, out string? error)
+    {
+        try
+        {
+            string json = form["layers"].ToString();
+            layerRequests = string.IsNullOrWhiteSpace(json)
+                ? Array.Empty<LayerRequest>()
+                : JsonSerializer.Deserialize<LayerRequest[]>(json, LayerJsonOptions) ?? Array.Empty<LayerRequest>();
+            error = null;
+            return true;
+        }
+        catch (JsonException exception)
+        {
+            layerRequests = Array.Empty<LayerRequest>();
+            error = "The 'layers' field is not valid JSON: " + exception.Message;
+            return false;
+        }
+    }
+
+    private async Task<RequestBuildResult> BuildCompositionRequestAsync(
+        IFormCollection form,
+        IFormFile baseImageFile,
+        LayerRequest[] layerRequests,
+        CancellationToken cancellationToken)
+    {
+        CompositionRequest compositionRequest = new CompositionRequest();
+        compositionRequest.BaseImageFileName = baseImageFile.FileName;
+
+        byte[] baseImageContent = await StreamHelpers.ReadFullyAsync(baseImageFile.OpenReadStream(), cancellationToken);
+        compositionRequest.BaseImage = new MemoryStream(baseImageContent, writable: false);
+
+        for (int i = 0; i < layerRequests.Length; i++)
+        {
+            if (!TryCreateLayer(layerRequests[i], i, form, out Layer? layer, out string? error))
+            {
+                return new RequestBuildResult(null, error);
+            }
+
+            compositionRequest.Layers.Add(layer!);
+        }
+
+        return new RequestBuildResult(compositionRequest, null);
+    }
+
+    private bool TryCreateLayer(
+        LayerRequest layerRequest,
+        int index,
+        IFormCollection form,
+        out Layer? layer,
+        out string? error)
+    {
+        layer = new Layer();
+        layer.Type = (layerRequest.Type ?? string.Empty).Trim().ToLowerInvariant();
+        layer.X = layerRequest.X;
+        layer.Y = layerRequest.Y;
+        layer.ZIndex = layerRequest.ZIndex;
+        layer.Opacity = layerRequest.Opacity;
+
+        if (layer.Type == LayerTypes.Image)
+        {
+            IFormFile? layerFile = string.IsNullOrWhiteSpace(layerRequest.ImageKey)
+                ? null
+                : form.Files[layerRequest.ImageKey];
+
+            if (layerFile is null)
+            {
+                error = "Layer " + index + ": no uploaded file matches the image key '" + layerRequest.ImageKey + "'.";
+                return false;
+            }
+
+            string? uploadError = ValidateUpload(layerFile);
+
+            if (uploadError is not null)
+            {
+                error = "Layer " + index + ": " + uploadError;
+                return false;
+            }
+
+            layer.FileName = layerFile.FileName;
+            layer.Image = layerFile.OpenReadStream();
+        }
+        else if (layer.Type == LayerTypes.Solid)
+        {
+            layer.Width = layerRequest.Width;
+            layer.Height = layerRequest.Height;
+            layer.Color = layerRequest.Color;
+        }
+        else if (layer.Type == LayerTypes.Blur)
+        {
+            layer.Width = layerRequest.Width;
+            layer.Height = layerRequest.Height;
+            layer.Sigma = layerRequest.Sigma;
+        }
+        else
+        {
+            error = "Layer " + index + ": unsupported layer type '" + layerRequest.Type + "'.";
+            return false;
+        }
+
+        error = null;
+        return true;
+    }
+
+    private sealed record RequestBuildResult(CompositionRequest? Request, string? Error);
+
+    private sealed record CompositionExecutionResult(
+        Guid? CompositionId,
+        CompositionResult? Result,
+        string? Error);
+
+    private async Task<CompositionExecutionResult> ComposeAndStoreAsync(
+        CompositionRequest request,
+        CancellationToken cancellationToken)
+    {
+        Composition composition = CreatePendingComposition(request);
+        await repository.CreateCompositionAsync(composition, cancellationToken);
+
+        CompositionResult result;
+
+        try
+        {
+            result = await compositionService.ComposeAsync(request, cancellationToken);
+        }
+        catch (UnknownImageFormatException exception)
+        {
+            await repository.MarkFailedAsync(composition.Id, exception.Message, cancellationToken);
+            return new CompositionExecutionResult(null, null, "One of the uploaded files is not a supported image.");
+        }
+        catch (ImageFormatException exception)
+        {
+            await repository.MarkFailedAsync(composition.Id, exception.Message, cancellationToken);
+            return new CompositionExecutionResult(null, null, "One of the uploaded images could not be decoded.");
+        }
+        catch (Exception exception)
+        {
+            logger.LogError(exception, "Composition {CompositionId} failed.", composition.Id);
+            await repository.MarkFailedAsync(composition.Id, exception.Message, cancellationToken);
+            throw;
+        }
+
+        await StoreLayersAsync(composition.Id, request.Layers, cancellationToken);
+        await repository.MarkCompletedAsync(
+            composition.Id,
+            result.OutputSizeBytes,
+            (int)result.ProcessingTimeMs,
+            cancellationToken);
+
+        return new CompositionExecutionResult(composition.Id, result, null);
+    }
+
+    private static Composition CreatePendingComposition(CompositionRequest request)
+    {
+        return new Composition
+        {
+            Id = Guid.NewGuid(),
+            CreatedAt = DateTimeOffset.UtcNow,
+            Status = CompositionStatus.Pending,
+            BaseImageFileName = request.BaseImageFileName,
+            LayerCount = request.Layers.Count,
+        };
+    }
+
+    private async Task StoreLayersAsync(Guid compositionId, IEnumerable<Layer> layers, CancellationToken cancellationToken)
+    {
+        foreach (Layer layer in layers)
+        {
+            await repository.AddLayerAsync(CreateStoredLayer(compositionId, layer), cancellationToken);
+        }
+    }
+
+    private static CompositionLayer CreateStoredLayer(Guid compositionId, Layer layer)
+    {
+        return new CompositionLayer
+        {
+            Id = Guid.NewGuid(),
+            CompositionId = compositionId,
+            LayerType = layer.Type,
+            X = layer.X,
+            Y = layer.Y,
+            Opacity = layer.Opacity,
+            ZIndex = layer.ZIndex,
+            FileName = layer.FileName,
+            Width = layer.Width,
+            Height = layer.Height,
+            Color = layer.Color,
+            Sigma = layer.Sigma,
+        };
     }
 }
